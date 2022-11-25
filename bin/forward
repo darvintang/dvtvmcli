@@ -1,0 +1,235 @@
+#!/bin/zsh
+
+socatBinPath=$(which socat)
+if [ "$socatBinPath" = "" ];then
+	echo "未安装socat"
+	echo "安装：brew install socat"
+	exit
+fi
+
+selfpath=$0
+ctl=$1
+
+socatPath="$HOME/.socat"
+
+if [ ! -d $socatPath ]; then
+  mkdir $socatPath
+fi
+
+ip=""
+from=""
+to=""
+deal=""
+
+function handle_parameter {
+	for parameter in "$@"; do
+		if [[ $parameter =~ "ip=" ]];then
+			tip=${parameter#*ip=}
+			check_ip $tip
+			ip=$tip
+		fi
+		if [[ $parameter =~ "from=" ]];then
+			tfrom=${parameter#*from=}
+			check_port $tfrom
+			from=$tfrom
+		fi
+		if [[ $parameter =~ "to=" ]];then
+			tto=${parameter#*to=}
+			check_port $tto
+			to=$tto
+		fi
+		if [[ $parameter =~ "deal=" ]];then
+			tdeal=${parameter#*deal=}
+			deal=$tdeal
+		fi
+	done
+}
+
+function echo_help {
+	name=${selfpath##*/}
+	echo "用法："
+	echo "    $name start ip=目标ip from=本机端口 to=目标端口 [deal={tcp|udp}]"
+	echo "    eg: $name ip=192.168.1.101 from=80 to=80 <将本地80端口tcp报文转发到192.168.1.101主机的80端口>"
+	echo "    eg: $name ip=192.168.1.101 from=80 to=80 deal=udp <将本地80端口udp报文转发到192.168.1.101主机的80端口>"
+	echo "    $name stop [ip=目标ip|from=本机端口|to=目标端口|deal={tcp|udp}]"
+	echo "    $name list"
+	exit
+}
+
+function check_ip {
+    IP=$1
+    VALID_CHECK=$(echo $IP|awk -F. '$1<=255&&$2<=255&&$3<=255&&$4<=255{print "yes"}')
+    if echo $IP|grep -E "^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$">/dev/null; then
+        if [ ${VALID_CHECK:-no} != "yes" ]; then
+        	echo "IP 不可用"
+        	echo_help
+        fi
+    else
+        echo "IP 格式错误"
+        echo_help
+    fi
+}
+
+function check_port {
+	port=$1
+	if [ -n "$port" -a "$port" = "${port//[^0-9]/}" ]; then
+		if [ $port -le 0 -o $port -ge 65536 ]; then
+			echo "端口不在合法范围： $port"
+			echo_help
+		fi
+	else
+		echo "端口格式非法： $port"
+		echo_help
+	fi
+}
+
+function parameter_detection_start {
+	check_ip $ip
+	check_port $from
+	check_port $to
+
+	if [ "$ip" = "" -o "$from" = "" -o "$to" = "" ]; then
+		echo "缺少参数"
+		echo_help
+	fi
+
+	if [ "$deal" != "tcp" -a "$deal" != "udp" ]; then
+		echo "协议错误"
+		echo_help
+	fi
+}
+
+function start {
+	parameter_detection_start
+
+	outpath="$socatPath/ip<$ip>-from<$from>-to<$to>-deal<$deal>.log"
+	if [ -f $outpath ]; then
+		# 监听存在了
+		pid=$(cat "$outpath")
+		runPid=`ps -ef | grep "$pid" | grep -v grep | awk '{print $2}'`
+		if [ "$runPid" = "$pid" ];then
+			echo "已经启动转发 目标IP:$ip 监听端口:$from 目标端口:$to 协议:$deal 进程:$pid"
+			exit
+		fi
+	fi
+
+	echo "启动端口转发"
+	rm -rf $outpath
+	if [ "$deal" = "tcp" ]; then
+		pid=`nohup socat TCP4-LISTEN:$from,fork TCP4:$ip:$to > "$outpath" 2>&1 & echo $!`
+	elif [ "$deal" = "udp" ]; then
+		pid=`nohup socat UDP4-LISTEN:$from,fork UDP4:$ip:$to > "$outpath" 2>&1 & echo $!`
+	fi
+
+	# 等待端口监听结果
+	sleep 1
+	runPid=`ps -ef | grep "$pid" | grep -v grep | awk '{print $2}'`
+	if [ "$runPid" = "$pid" ];then
+		echo "开始转发 目标IP:$ip 监听端口:$from 目标端口:$to 协议:$deal 进程:$pid"
+		echo $pid > $outpath
+	else
+		result=$(cat "$outpath")
+		echo "启动端口转发失败"
+		if [ "$result" != "" ]; then
+			echo $result
+		fi
+		rm -rf $outpath
+	fi
+}
+
+function stop {
+	count=`ls -l "$socatPath" | grep ".log" | wc -l`
+	if [ $count -eq 0 ]; then
+		echo "没有正在运行的端口转发任务"
+		exit
+	fi
+
+	if [ "$deal" != "tcp" -a "$deal" != "udp" -a "$deal" != "" ]; then
+		echo "协议错误"
+		echo_help
+	fi
+
+	for infoFile in "$socatPath"/*.log; do
+		info=${infoFile##*/}
+		fip=${"${info##*ip<}"%%>*}
+		ffrom=${"${info##*from<}"%%>*}
+		fto=${"${info##*to<}"%%>*}
+		fdeal=${"${info##*deal<}"%%>*}
+
+		if [ "$ip" = "" -o "$fip" = "$ip" ]; then
+			if [ "$from" = "" -o "$ffrom" = "$from" ]; then
+				if [ "$to" = "" -o "$fto" = "$to" ]; then
+					if [ "$deal" = "" -o "$fdeal" = "$deal" ]; then
+						pid=$(cat $infoFile)
+						runPid=`ps -ef | grep "$pid" | grep -v grep | awk '{print $2}'`
+						if [ "$runPid" = "$pid" ];then
+							result=$(kill -9 $pid)
+							if [ "$result" = "" ]; then
+								echo "停止转发 目标IP:$fip 监听端口:$ffrom 目标端口:$fto 协议:$fdeal 进程:$pid"
+								rm -rf $infoFile
+							else
+								echo $result
+							fi
+						else
+							rm -rf $infoFile
+						fi
+					fi
+				fi
+			fi
+		fi
+	done
+
+}
+
+function list {
+	count=`ls -l "$socatPath" | grep ".log" | wc -l`
+	if [ $count -eq 0 ]; then
+		exit
+	fi
+	flag=""
+	for infoFile in "$socatPath"/*.log; do
+		pid=$(cat $infoFile)
+		runPid=`ps -ef | grep "$pid" | grep -v grep | awk '{print $2}'`
+		if [ "$runPid" = "$pid" ];then
+			info=${infoFile##*/}
+			tip=${"${info##*ip<}"%%>*}
+			tfrom=${"${info##*from<}"%%>*}
+			tto=${"${info##*to<}"%%>*}
+			tdeal=${"${info##*deal<}"%%>*}
+			if [ "$flag" = "" ]; then
+				title="目标IP"
+				printf ${(r:18:)title}
+				title="本机端口"
+				printf ${(r:8:)title}
+				title="目标端口"
+				printf ${(r:8:)title}
+				title="协议"
+				printf ${(r:6:)title}
+				title="PID"
+				printf ${(r:8:)title}
+				printf "\n"
+				flag="t"
+			fi
+			printf ${(r:20:)tip}
+			printf ${(r:12:)tfrom}
+			printf ${(r:12:)tto}
+			printf ${(r:8:)tdeal}
+			printf ${(r:8:)pid}
+			printf "\n"
+		else
+			rm -rf $infoFile
+		fi
+	done
+}
+
+if [ "$ctl" = "start" ]; then
+	handle_parameter $@
+	start
+elif [ "$ctl" = "stop" ]; then
+	handle_parameter $@
+	stop
+elif [ "$ctl" = "list" ]; then
+	list
+else
+	echo_help
+fi
